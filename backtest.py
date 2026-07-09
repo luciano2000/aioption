@@ -1,184 +1,104 @@
-"""Bot spike-fade para conta DEMO da Deriv.
+"""Backtest da estrategia spike-fade (aposta contraria a picos extremos).
 
-⚠️ USE APENAS EM CONTA VIRTUAL (demo). Crie o token em:
-   app.deriv.com > Configurações > Token de API (escopos: read, trade)
-   com a conta VIRTUAL selecionada. Token de demo começa a operar com
-   $10.000 fictícios.
+Regra: mercado de lado -> "parede" gigante (outlier) -> aposta na direcao
+contraria (reversao a media), contrato binario Rise/Fall de E minutos.
 
-Config via variáveis de ambiente:
-   DERIV_TOKEN   (obrigatório)
-   DERIV_APP_ID  (padrão 1089 — registre o seu em api.deriv.com)
-   SYMBOL        (padrão R_100)
-   Z_THRESHOLD   (padrão 3.5)
-   EXPIRY_MIN    (padrão 5)
-   STAKE         (padrão 1.0, em USD)
-   STOP_LOSS_DAY (padrão 20.0 — para o bot no dia após perder isso)
-   STOP_WIN_DAY  (padrão 50.0)
-
-Roda: DERIV_TOKEN=xxx python3 bot.py
-Logs em trades.sqlite (tabela trades) + stdout.
+Uso: python3 backtest.py R_100_1m.csv [payout_liquido]
 """
-import asyncio
-import json
+import csv
 import math
-import os
-import sqlite3
-import time
-from collections import deque
-from datetime import date
-
-import websockets
-
-TOKEN = os.environ.get("DERIV_TOKEN")
-APP_ID = os.environ.get("DERIV_APP_ID", "1089")
-SYMBOL = os.environ.get("SYMBOL", "R_100")
-Z_TH = float(os.environ.get("Z_THRESHOLD", "3.5"))
-EXPIRY = int(os.environ.get("EXPIRY_MIN", "5"))
-STAKE = float(os.environ.get("STAKE", "1.0"))
-STOP_LOSS_DAY = float(os.environ.get("STOP_LOSS_DAY", "20.0"))
-STOP_WIN_DAY = float(os.environ.get("STOP_WIN_DAY", "50.0"))
-WINDOW = 30
-URI = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-
-DB = sqlite3.connect(os.environ.get("DB_PATH", "trades.sqlite"))
-DB.execute("""CREATE TABLE IF NOT EXISTS trades(
-    ts INTEGER, symbol TEXT, direction TEXT, z REAL, stake REAL,
-    contract_id INTEGER, payout REAL, profit REAL, status TEXT)""")
-DB.commit()
+import sys
+from dataclasses import dataclass
 
 
-def log_trade(**kw) -> None:
-    DB.execute(
-        "INSERT INTO trades VALUES(:ts,:symbol,:direction,:z,:stake,"
-        ":contract_id,:payout,:profit,:status)", kw)
-    DB.commit()
+@dataclass
+class Result:
+    z: float
+    expiry: int
+    calm: bool
+    trades: int
+    wins: int
+    pnl: float
+    max_dd: float
+
+    @property
+    def winrate(self):
+        return self.wins / self.trades if self.trades else 0.0
 
 
-class SpikeBot:
-    def __init__(self) -> None:
-        self.rets: deque[float] = deque(maxlen=WINDOW)
-        self.last_close: float | None = None
-        self.pnl_today = 0.0
-        self.day = date.today()
-        self.busy = False
-
-    def daily_guard(self) -> bool:
-        if date.today() != self.day:
-            self.day, self.pnl_today = date.today(), 0.0
-        if self.pnl_today <= -STOP_LOSS_DAY:
-            print(f"[guard] stop-loss diário atingido ({self.pnl_today:+.2f}). Pausado até amanhã.")
-            return False
-        if self.pnl_today >= STOP_WIN_DAY:
-            print(f"[guard] meta diária atingida ({self.pnl_today:+.2f}). Pausado até amanhã.")
-            return False
-        return True
-
-    def signal(self, close: float) -> str | None:
-        """Alimenta com o close de cada vela de 1min; retorna PUT/CALL/None."""
-        if self.last_close is not None:
-            self.rets.append((close - self.last_close) / self.last_close)
-        self.last_close = close
-        if len(self.rets) < WINDOW:
-            return None
-        w = list(self.rets)[:-1]
-        mu = sum(w) / len(w)
-        var = sum((r - mu) ** 2 for r in w) / (len(w) - 1)
-        sd = math.sqrt(var) if var > 0 else 1e-12
-        z = (self.rets[-1] - mu) / sd
-        if z >= Z_TH:
-            return "PUT"    # parede pra cima -> aposta que volta (cai)
-        if z <= -Z_TH:
-            return "CALL"   # parede pra baixo -> aposta que sobe
-        return None
+def load(path):
+    with open(path) as f:
+        return [{k: float(v) for k, v in row.items()} for row in csv.DictReader(f)]
 
 
-async def buy(ws, direction: str, z: float) -> None:
-    await ws.send(json.dumps({
-        "buy": 1, "price": STAKE,
-        "parameters": {
-            "amount": STAKE, "basis": "stake", "contract_type": direction,
-            "currency": "USD", "duration": EXPIRY, "duration_unit": "m",
-            "symbol": SYMBOL,
-        },
-    }))
+def _stats(ps, ps2, a, b):
+    """media e desvio amostral de rets[a:b] via somas de prefixo, O(1)."""
+    n = b - a
+    s = ps[b] - ps[a]
+    s2 = ps2[b] - ps2[a]
+    mu = s / n
+    var = (s2 - n * mu * mu) / (n - 1) if n > 1 else 0.0
+    return mu, math.sqrt(var) if var > 0 else 1e-12
 
 
-async def main() -> None:
-    if not TOKEN:
-        raise SystemExit("Defina DERIV_TOKEN (token de API da conta VIRTUAL).")
-    bot = SpikeBot()
-    async with websockets.connect(URI) as ws:
-        # autentica
-        await ws.send(json.dumps({"authorize": TOKEN}))
-        auth = json.loads(await ws.recv())
-        if "error" in auth:
-            raise SystemExit(f"Auth falhou: {auth['error']['message']}")
-        acct = auth["authorize"]
-        if not acct.get("is_virtual"):
-            raise SystemExit("⛔ Este token é de conta REAL. Use conta VIRTUAL.")
-        print(f"Conectado: {acct['loginid']} (virtual) saldo {acct['balance']} {acct['currency']}")
+def run(candles, z_th, expiry, payout, window=30, calm_filter=False, stake=1.0):
+    closes = [c["close"] for c in candles]
+    rets = [0.0] + [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
+    n = len(closes)
+    ps = [0.0] * (n + 1)
+    ps2 = [0.0] * (n + 1)
+    for i, r in enumerate(rets):
+        ps[i+1] = ps[i] + r
+        ps2[i+1] = ps2[i] + r * r
+    trades = wins = 0
+    pnl = peak = max_dd = 0.0
+    i = window + 1
+    while i < n - expiry:
+        mu, sd = _stats(ps, ps2, i - window, i)
+        z = (rets[i] - mu) / sd
+        if calm_filter:
+            _, sd_prev = _stats(ps, ps2, i - window, i - 5)
+            pass_calm = sd_prev <= sd * 0.8
+        else:
+            pass_calm = True
+        if abs(z) >= z_th and pass_calm:
+            entry = closes[i]
+            exit_ = closes[i + expiry]
+            win = exit_ < entry if z > 0 else exit_ > entry
+            trades += 1
+            if win:
+                wins += 1
+                pnl += stake * payout
+            else:
+                pnl -= stake
+            peak = max(peak, pnl)
+            max_dd = max(max_dd, peak - pnl)
+            i += expiry
+        else:
+            i += 1
+    return Result(z_th, expiry, calm_filter, trades, wins, pnl, max_dd)
 
-        # assina candles de 1min e atualizações de contratos
-        await ws.send(json.dumps({
-            "ticks_history": SYMBOL, "style": "candles", "granularity": 60,
-            "count": WINDOW + 2, "end": "latest", "subscribe": 1,
-        }))
-        await ws.send(json.dumps({"proposal_open_contract": 1, "subscribe": 1}))
 
-        last_epoch = 0
-        pending_z = 0.0
-        async for raw in ws:
-            msg = json.loads(raw)
-            mt = msg.get("msg_type")
-
-            if mt == "candles":  # carga inicial
-                for c in msg["candles"][:-1]:
-                    bot.signal(float(c["close"]))
-                last_epoch = msg["candles"][-1]["epoch"]
-
-            elif mt == "ohlc":
-                o = msg["ohlc"]
-                epoch = int(o["open_time"])
-                if epoch != last_epoch and last_epoch:
-                    # vela anterior fechou -> avalia sinal
-                    sig = bot.signal(float(o["open"]))
-                    if sig and not bot.busy and bot.daily_guard():
-                        bot.busy = True
-                        pending_z = 0.0
-                        print(f"[{time.strftime('%H:%M:%S')}] sinal {sig} -> comprando {STAKE} USD, exp {EXPIRY}m")
-                        await buy(ws, sig, pending_z)
-                last_epoch = epoch
-
-            elif mt == "buy":
-                if "error" in msg:
-                    print(f"[erro compra] {msg['error']['message']}")
-                    bot.busy = False
-                else:
-                    b = msg["buy"]
-                    print(f"  contrato {b['contract_id']} comprado por {b['buy_price']}")
-
-            elif mt == "proposal_open_contract":
-                c = msg.get("proposal_open_contract", {})
-                if c.get("is_sold"):
-                    profit = float(c.get("profit", 0))
-                    bot.pnl_today += profit
-                    bot.busy = False
-                    status = "WIN" if profit > 0 else "LOSS"
-                    print(f"  {status} {profit:+.2f} | P&L hoje: {bot.pnl_today:+.2f}")
-                    log_trade(ts=int(time.time()), symbol=SYMBOL,
-                              direction=c.get("contract_type", "?"), z=pending_z,
-                              stake=STAKE, contract_id=c.get("contract_id", 0),
-                              payout=float(c.get("payout", 0)), profit=profit,
-                              status=status)
-
-            elif "error" in msg:
-                print(f"[erro] {msg['error']['message']}")
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else "R_100_1m.csv"
+    payout = float(sys.argv[2]) if len(sys.argv) > 2 else 0.92
+    candles = load(path)
+    days = (candles[-1]["epoch"] - candles[0]["epoch"]) / 86400
+    be = 1 / (1 + payout)
+    print(f"{path}: {len(candles)} candles ({days:.1f} dias) | payout liquido {payout:.2f} | break-even: {be:.1%}\n")
+    header = f"{'z':>4} {'exp':>4} {'calmo':>6} {'trades':>7} {'winrate':>8} {'P&L($1/op)':>11} {'maxDD':>8}"
+    print(header)
+    print("-" * len(header))
+    for calm in (False, True):
+        for z in (2.5, 3.0, 3.5, 4.0, 5.0):
+            for expiry in (1, 3, 5, 10):
+                r = run(candles, z, expiry, payout, calm_filter=calm)
+                if r.trades == 0:
+                    continue
+                print(f"{r.z:>4.1f} {r.expiry:>3}m {str(r.calm):>6} {r.trades:>7} {r.winrate:>7.1%} {r.pnl:>+11.2f} {r.max_dd:>8.2f}")
+    print("\nLeitura: P&L = lucro/prejuizo total apostando $1 por operacao.")
+    print(f"Para lucrar, o win rate precisa ficar acima de {be:.1%} de forma estavel.")
 
 
 if __name__ == "__main__":
-    while True:
-        try:
-            asyncio.run(main())
-        except (websockets.ConnectionClosed, OSError) as e:
-            print(f"[reconectando em 5s] {e}")
-            time.sleep(5)
+    main()
