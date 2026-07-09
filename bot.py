@@ -29,7 +29,7 @@ from datetime import date
 
 import websockets
 
-TOKEN = os.environ.get("DERIV_TOKEN")
+TOKEN = (os.environ.get("DERIV_TOKEN") or "").strip().strip('"').strip("'")
 APP_ID = os.environ.get("DERIV_APP_ID", "1089")
 SYMBOL = os.environ.get("SYMBOL", "R_100")
 Z_TH = float(os.environ.get("Z_THRESHOLD", "3.5"))
