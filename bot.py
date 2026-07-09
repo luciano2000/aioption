@@ -115,7 +115,19 @@ async def main() -> None:
             raise SystemExit(f"Auth falhou: {auth['error']['message']}")
         acct = auth["authorize"]
         if not acct.get("is_virtual"):
-            raise SystemExit("⛔ Este token é de conta REAL. Use conta VIRTUAL.")
+            # token de usuario: procura a conta VIRTUAL (VRTC) e troca pra ela
+            virt = next((a for a in acct.get("account_list", [])
+                         if a.get("is_virtual")), None)
+            if not virt:
+                raise SystemExit("⛔ Nenhuma conta VIRTUAL encontrada no seu usuario Deriv.")
+            print(f"Token autorizou {acct['loginid']} (real); trocando para {virt['loginid']} (virtual)...")
+            await ws.send(json.dumps({"authorize": TOKEN, "loginid": virt["loginid"]}))
+            auth = json.loads(await ws.recv())
+            if "error" in auth:
+                raise SystemExit(f"Falha ao trocar p/ conta virtual: {auth['error']['message']}")
+            acct = auth["authorize"]
+            if not acct.get("is_virtual"):
+                raise SystemExit("⛔ Nao consegui autorizar a conta VIRTUAL. Abortando por seguranca.")
         print(f"Conectado: {acct['loginid']} (virtual) saldo {acct['balance']} {acct['currency']}")
 
         # assina candles de 1min e atualizações de contratos
